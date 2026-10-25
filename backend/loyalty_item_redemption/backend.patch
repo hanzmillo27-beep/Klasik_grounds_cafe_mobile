@@ -1,0 +1,563 @@
+diff --git a/app/Models/Loyalty.php b/app/Models/Loyalty.php
+index b2ac846..6babd58 100644
+--- a/app/Models/Loyalty.php
++++ b/app/Models/Loyalty.php
+@@ -29,7 +29,9 @@ class Loyalty extends Model
+                 reward_code,
+                 used_sale_id,
+                 used_at,
+-                status
++                status,
++                product_id,
++                product_name
+              FROM (
+                 SELECT
+                     \'earned\' AS activity_type,
+@@ -39,7 +41,9 @@ class Loyalty extends Model
+                     NULL AS reward_code,
+                     NULL AS used_sale_id,
+                     NULL AS used_at,
+-                    NULL AS status
++                    NULL AS status,
++                    NULL AS product_id,
++                    NULL AS product_name
+                 FROM loyalty_earnings
+                 WHERE user_id = ?
+ 
+@@ -47,14 +51,16 @@ class Loyalty extends Model
+ 
+                 SELECT
+                     \'redeemed\' AS activity_type,
+-                    \'Free coffee reward\' AS description,
++                    COALESCE(product_name, \'Free coffee reward\') AS description,
+                     created_at AS activity_date,
+                     -points_spent AS points,
+                     reward_code,
+                     used_sale_id,
+                     used_at,
+                     CASE WHEN used_sale_id IS NULL AND used_at IS NULL
+-                        THEN \'available\' ELSE \'used\' END AS status
++                        THEN \'available\' ELSE \'used\' END AS status,
++                    product_id,
++                    product_name
+                 FROM loyalty_redemptions
+                 WHERE user_id = ?
+              ) AS activity
+@@ -84,7 +90,8 @@ class Loyalty extends Model
+ 
+         $stmt = $this->db->prepare(
+             'SELECT rewards.reward_code, users.username AS customer_name, rewards.user_id,
+-                rewards.created_at, rewards.points_spent, rewards.used_sale_id, rewards.used_at
++                rewards.created_at, rewards.points_spent, rewards.used_sale_id, rewards.used_at,
++                rewards.product_id, rewards.product_name
+              FROM loyalty_redemptions rewards
+              INNER JOIN users ON users.id = rewards.user_id
+              WHERE rewards.reward_code = ?'
+@@ -96,13 +103,87 @@ class Loyalty extends Model
+             throw new \Exception('This free coffee reward has already been used.');
+         }
+ 
+-        return [
++        $result = [
+             'reward_code' => $reward->reward_code,
+             'customer_name' => $reward->customer_name,
+             'user_id' => (int) $reward->user_id,
+             'created_at' => $reward->created_at,
+             'points_spent' => (int) $reward->points_spent,
+         ];
++        if ($reward->product_id !== null) {
++            $result['product_id'] = (int) $reward->product_id;
++            $result['product_name'] = $reward->product_name;
++        }
++        return $result;
++    }
++
++    public function redeemItem(int $userId, int $productId): array
++    {
++        if ($userId < 1 || $productId < 1) {
++            throw new \InvalidArgumentException('Choose a valid item to redeem.');
++        }
++
++        $this->db->beginTransaction();
++        try {
++            $stmt = $this->db->prepare(
++                'SELECT loyalty_points FROM loyal WHERE user_id = ?' . $this->lockClause()
++            );
++            $stmt->execute([$userId]);
++            $loyalty = $stmt->fetch();
++            $points = $loyalty ? (int) $loyalty->loyalty_points : 0;
++            if ($points < self::POINTS_PER_REWARD) {
++                throw new \Exception('You need 10 points to redeem an item.');
++            }
++
++            // The saved catalog item binds this voucher to one item. Issuing
++            // a voucher validates stock but does not reserve or consume it.
++            $stmt = $this->db->prepare(
++                'SELECT p.product_id, p.product_name, p.is_active, p.is_available,
++                    ' . ProductAvailability::stockSql() . ' AS stock_available
++                 FROM products p WHERE p.product_id = ?' . $this->lockClause()
++            );
++            $stmt->execute([$productId]);
++            $product = $stmt->fetch();
++            if (!$product) {
++                throw new \Exception('This item is no longer available. Choose another item.');
++            }
++            ProductAvailability::apply($product);
++            if (!$product->can_order) {
++                throw new \Exception('This item is unavailable. Choose another item.');
++            }
++
++            $stmt = $this->db->prepare(
++                'UPDATE loyal SET loyalty_points = loyalty_points - ?
++                 WHERE user_id = ? AND loyalty_points >= ?'
++            );
++            $stmt->execute([self::POINTS_PER_REWARD, $userId, self::POINTS_PER_REWARD]);
++            if ($stmt->rowCount() !== 1) {
++                throw new \Exception('Your points changed. Refresh and try again.');
++            }
++
++            $rewardCode = 'GC-' . strtoupper(bin2hex(random_bytes(4)));
++            $stmt = $this->db->prepare(
++                'INSERT INTO loyalty_redemptions
++                    (user_id, reward_code, points_spent, product_id, product_name)
++                 VALUES (?, ?, ?, ?, ?)'
++            );
++            $stmt->execute([
++                $userId, $rewardCode, self::POINTS_PER_REWARD,
++                (int) $product->product_id, $product->product_name
++            ]);
++            $this->db->commit();
++
++            return [
++                'reward_code' => $rewardCode,
++                'points' => $points - self::POINTS_PER_REWARD,
++                'points_spent' => self::POINTS_PER_REWARD,
++                'product_id' => (int) $product->product_id,
++                'product_name' => $product->product_name
++            ];
++        } catch (\Throwable $error) {
++            if ($this->db->inTransaction()) $this->db->rollBack();
++            throw $error;
++        }
+     }
+ 
+     public function redeem(int $userId): array
+diff --git a/app/Models/POS.php b/app/Models/POS.php
+index fa4c5ea..b5e277b 100644
+--- a/app/Models/POS.php
++++ b/app/Models/POS.php
+@@ -189,10 +189,10 @@ class POS extends Model
+                 if ($kioskOrderId !== null) throw new \Exception('Use a reward separately from a kiosk order.');
+                 $rewardItems = $this->cartQuantities($data['items'] ?? null);
+                 if (count($rewardItems) !== 1 || reset($rewardItems) !== 1) {
+-                    throw new \Exception('A reward covers exactly one coffee. Choose one item with quantity 1.');
++                    throw new \Exception('A reward covers exactly one item. Choose one item with quantity 1.');
+                 }
+                 if (Money::paymentCents($data['amount_paid'] ?? null) !== 0) {
+-                    throw new \Exception('A free coffee reward requires no payment. Enter 0.00.');
++                    throw new \Exception('A free item reward requires no payment. Enter 0.00.');
+                 }
+             }
+             $fingerprint = $checkoutKey === null ? null : $this->checkoutFingerprint($data, $kioskOrderId, $rewardCode);
+@@ -210,7 +210,7 @@ class POS extends Model
+             }
+ 
+             if ($rewardCode !== null) {
+-                $stmt = $this->db->prepare('SELECT reward_code, used_sale_id, used_at
++                $stmt = $this->db->prepare('SELECT reward_code, used_sale_id, used_at, product_id
+                     FROM loyalty_redemptions WHERE reward_code = ?' . $this->lockClause());
+                 $stmt->execute([$rewardCode]);
+                 $reward = $stmt->fetch();
+@@ -218,6 +218,10 @@ class POS extends Model
+                 if ($reward->used_sale_id !== null || $reward->used_at !== null) {
+                     throw new \Exception('This reward code has already been used.');
+                 }
++                if ($reward->product_id !== null
++                    && (int) array_key_first($rewardItems) !== (int) $reward->product_id) {
++                    throw new \Exception('Choose the item saved with this reward code.');
++                }
+             }
+ 
+             $kioskOrder = null;
+@@ -318,7 +322,7 @@ class POS extends Model
+                         'A product in this order is unavailable. Please review the order.'
+                     );
+                 }
+-                if ($rewardCode !== null) {
++                if ($rewardCode !== null && $reward->product_id === null) {
+                     $stmt = $this->db->prepare('SELECT category_name FROM categories WHERE category_id = ?' . $this->lockClause());
+                     $stmt->execute([$product->category_id]);
+                     if (!RewardEligibility::isCoffeeCategory($stmt->fetchColumn())) {
+diff --git a/app/api/Loyalty/LoyaltyController.php b/app/api/Loyalty/LoyaltyController.php
+index 224be7b..15f8cf3 100644
+--- a/app/api/Loyalty/LoyaltyController.php
++++ b/app/api/Loyalty/LoyaltyController.php
+@@ -54,4 +54,39 @@ class LoyaltyController extends BaseController
+             ]);
+         }
+     }
++
++    public function redeemItem(): void
++    {
++        if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
++            http_response_code(405);
++            $this->json(['status' => 'error', 'message' => 'Use POST to redeem an item.']);
++            return;
++        }
++
++        try {
++            $userId = $this->customerId();
++            $input = json_decode(file_get_contents('php://input'), true, 512, JSON_THROW_ON_ERROR);
++            if (!is_array($input) || !array_key_exists('product_id', $input)) {
++                throw new \InvalidArgumentException('Choose an item to redeem.');
++            }
++            if (!is_int($input['product_id']) || $input['product_id'] < 1) {
++                throw new \InvalidArgumentException('Choose a valid item to redeem.');
++            }
++            $result = $this->Loyalty->redeemItem($userId, $input['product_id']);
++        } catch (\JsonException $error) {
++            http_response_code(400);
++            $this->json(['status' => 'error', 'message' => 'Send a JSON object with the item to redeem.']);
++            return;
++        } catch (\Throwable $error) {
++            http_response_code(400);
++            $this->json(['status' => 'error', 'message' => $error->getMessage()]);
++            return;
++        }
++
++        $this->json([
++            'status' => 'success',
++            'message' => 'Item redeemed. Show the reward code to the cashier.',
++            'data' => $result
++        ]);
++    }
+ }
+diff --git a/app/api/POS/POSController.php b/app/api/POS/POSController.php
+index fdff672..88c89ec 100644
+--- a/app/api/POS/POSController.php
++++ b/app/api/POS/POSController.php
+@@ -82,8 +82,11 @@ class POSController extends BaseController
+             if (!is_string($code)) throw new \InvalidArgumentException('Enter a valid reward code (GC-XXXXXXXX).');
+             $reward = (new Loyalty())->reward($code);
+             unset($reward['user_id']);
+-            $reward['products'] = array_values(array_filter($this->POS->products(), function ($product) {
+-                return $product->can_order && RewardEligibility::isCoffeeCategory($product->category_name);
++            $reward['products'] = array_values(array_filter($this->POS->products(), function ($product) use ($reward) {
++                if (!$product->can_order) return false;
++                return isset($reward['product_id'])
++                    ? (int) $product->product_id === $reward['product_id']
++                    : RewardEligibility::isCoffeeCategory($product->category_name);
+             }));
+         } catch (\Throwable $error) {
+             http_response_code(400);
+diff --git a/migrations/037_loyalty_item_redemption.sql b/migrations/037_loyalty_item_redemption.sql
+new file mode 100644
+index 0000000..7188f28
+--- /dev/null
++++ b/migrations/037_loyalty_item_redemption.sql
+@@ -0,0 +1,5 @@
++-- Item-bound rewards extend existing coffee vouchers without changing usage.
++-- Snapshot columns intentionally have no product FK so history survives edits.
++ALTER TABLE loyalty_redemptions
++    ADD COLUMN IF NOT EXISTS product_id INTEGER,
++    ADD COLUMN IF NOT EXISTS product_name VARCHAR(150);
+diff --git a/public/js/POS.js b/public/js/POS.js
+index 4d9eda8..c66af6e 100644
+--- a/public/js/POS.js
++++ b/public/js/POS.js
+@@ -321,7 +321,7 @@ $(document).ready(function () {
+ 
+         function renderRewardSummary() {
+             $('#pos-reward-summary').toggleClass('d-none', !activeRewardCode)
+-                .text(activeRewardCode ? 'Free coffee reward: ' + activeRewardCode + '. Complete checkout to use this code.' : '');
++                .text(activeRewardCode ? 'Free item reward: ' + activeRewardCode + '. Complete checkout to use this code.' : '');
+             $('#amount_paid').prop('readOnly', activeRewardCode !== null);
+             if (activeRewardCode) {
+                 $('#amount_paid').val('0.00');
+@@ -435,7 +435,7 @@ $(document).ready(function () {
+             e.preventDefault();
+             if (loadingKiosk || checkingOut || deletingKiosk) return;
+             if (activeRewardCode) {
+-                msgBox('error', 'Complete or clear this free coffee reward before adding other products.');
++                msgBox('error', 'Complete or clear this reward before adding other products.');
+                 return;
+             }
+ 
+@@ -509,7 +509,7 @@ $(document).ready(function () {
+                                     ${formatMoney(item.product_price)} each
+                                 </div>
+                                 ${item.unavailable ? '<span class="badge badge-warning">Unavailable</span>' : ''}
+-                                ${activeRewardCode ? '<span class="badge badge-success">Free coffee reward</span>' : ''}
++                                ${activeRewardCode ? '<span class="badge badge-success">Free item reward</span>' : ''}
+                             </div>
+ 
+                             <div class="text-right ml-3">
+@@ -626,7 +626,7 @@ $(document).ready(function () {
+         function changeQuantity(id, amount) {
+             if (checkingOut || deletingKiosk) return;
+             if (activeRewardCode && amount > 0) {
+-                msgBox('error', 'A reward covers one coffee only.');
++                msgBox('error', 'A reward covers one item only.');
+                 return;
+             }
+             const item = cart.find(
+@@ -782,25 +782,25 @@ $(document).ready(function () {
+                 }
+                 const choices = reward.products.filter(product => product.can_order !== false);
+                 if (!choices.length) {
+-                    msgBox('error', 'No coffee is currently available for this reward. Please try again later.');
++                    msgBox('error', 'No item is currently available for this reward. Please try again later.');
+                     return;
+                 }
+                 const options = {};
+                 choices.forEach(product => { options[String(product.product_id)] = product.product_name; });
+                 const selection = await Swal.fire({
+-                    title: 'Choose your free coffee',
++                    title: 'Choose your free item',
+                     text: 'Reward ' + reward.reward_code + ' for ' + (reward.customer_name || 'loyal customer'),
+                     input: 'select',
+                     inputOptions: options,
+-                    inputPlaceholder: 'Choose a coffee',
++                    inputPlaceholder: 'Choose an item',
+                     showCancelButton: true,
+-                    confirmButtonText: 'Load free coffee',
+-                    inputValidator: value => value ? undefined : 'Choose a coffee to continue.'
++                    confirmButtonText: 'Load free item',
++                    inputValidator: value => value ? undefined : 'Choose an item to continue.'
+                 });
+                 if (!selection || !selection.isConfirmed) return;
+                 const product = choices.find(item => Number(item.product_id) === Number(selection.value));
+                 if (!product) {
+-                    msgBox('error', 'Choose an available coffee.');
++                    msgBox('error', 'Choose an available item.');
+                     return;
+                 }
+ 
+@@ -815,7 +815,7 @@ $(document).ready(function () {
+                 saveCustomerName();
+                 saveCart();
+                 renderCart();
+-                msgBox('success', 'Reward loaded. Complete checkout to serve one free coffee.');
++                msgBox('success', 'Reward loaded. Complete checkout to serve one free item.');
+             } catch (error) {
+                 msgBox('error', error && error.responseJSON && error.responseJSON.message
+                     || 'Unable to retrieve this reward. Please try again.');
+diff --git a/tests/loyalty_checkout.php b/tests/loyalty_checkout.php
+index 92f9463..7371dfb 100644
+--- a/tests/loyalty_checkout.php
++++ b/tests/loyalty_checkout.php
+@@ -98,8 +98,8 @@ foreach ([
+     [['reward_code' => 'KG-A1B2C3D4'], 'valid reward code'],
+     [['reward_code' => 'GC-FFFFFFFF'], 'Reward code not found'],
+     [['reward_code' => 'GC-C3D4E5F6'], 'already been used'],
+-    [['items' => [['product_id' => 1, 'quantity' => 2]]], 'exactly one coffee'],
+-    [['items' => [['product_id' => 1, 'quantity' => 1], ['product_id' => 3, 'quantity' => 1]]], 'exactly one coffee'],
++    [['items' => [['product_id' => 1, 'quantity' => 2]]], 'exactly one item'],
++    [['items' => [['product_id' => 1, 'quantity' => 1], ['product_id' => 3, 'quantity' => 1]]], 'exactly one item'],
+     [['kiosk_order_id' => 999], 'separately from a kiosk order'],
+     [['amount_paid' => '1.00'], 'requires no payment'],
+     [['items' => [['product_id' => 2, 'quantity' => 1]]], 'eligible coffee'],
+diff --git a/tests/loyalty_fixture.php b/tests/loyalty_fixture.php
+index 1638fe3..3925f90 100644
+--- a/tests/loyalty_fixture.php
++++ b/tests/loyalty_fixture.php
+@@ -6,5 +6,6 @@ $db->exec('CREATE TABLE loyalty_redemptions (
+     loyalty_redemption_id ' . $identity . ', user_id INTEGER NOT NULL REFERENCES users(id),
+     reward_code VARCHAR(20) NOT NULL UNIQUE, points_spent INTEGER NOT NULL DEFAULT 10,
+     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-    used_sale_id INTEGER REFERENCES sales(sale_id), used_at TIMESTAMP
++    used_sale_id INTEGER REFERENCES sales(sale_id), used_at TIMESTAMP,
++    product_id INTEGER, product_name VARCHAR(150)
+ )');
+diff --git a/tests/loyalty_item_rewards.php b/tests/loyalty_item_rewards.php
+new file mode 100644
+index 0000000..b9be7aa
+--- /dev/null
++++ b/tests/loyalty_item_rewards.php
+@@ -0,0 +1,186 @@
++<?php
++// Uses only the isolated test database created by loyalty_fixture.php.
++require __DIR__ . '/loyalty_fixture.php';
++
++function itemRewardSnapshot(PDO $db): string {
++    $snapshot = [];
++    foreach (['sales', 'sale_items', 'inventory', 'loyal', 'loyalty_earnings', 'loyalty_redemptions'] as $table) {
++        $snapshot[$table] = $db->query('SELECT * FROM ' . $table . ' ORDER BY 1')->fetchAll();
++    }
++    return json_encode($snapshot);
++}
++
++function rejectItemReward(callable $action, PDO $db, string $reason): void {
++    $before = itemRewardSnapshot($db);
++    $failed = false;
++    try { $action(); }
++    catch (PDOException | TypeError $error) {
++        throw new RuntimeException($reason . ' must fail through validation, not a database/type error.', 0, $error);
++    }
++    catch (Exception $error) { $failed = $error->getMessage() !== ''; }
++    check($failed && !$db->inTransaction() && itemRewardSnapshot($db) === $before,
++        $reason . ' must preserve points, vouchers, sales and stock.');
++}
++
++function itemRewardLookup(string $code): array {
++    $_SERVER['REQUEST_METHOD'] = 'GET';
++    http_response_code(200);
++    try { (new TestPOSController())->reward($code); }
++    catch (JsonResponse $response) { return $response->data; }
++    throw new RuntimeException('Reward lookup must return JSON.');
++}
++
++check((new Models\Users())->save([
++    'username' => 'item-reward-member', 'password' => 'password', 'role' => 'loyal_customer',
++]), 'Could not create the item reward customer.');
++$customerId = (int) (new Models\Users())->findByUsername('item-reward-member')->id;
++$db->prepare('INSERT INTO loyal (user_id, loyalty_points) VALUES (?, 25)')->execute([$customerId]);
++$db->exec("INSERT INTO categories (category_name) VALUES ('Foods')");
++$products = new Models\Products();
++foreach ([
++    ['product_name' => 'Buffalo Wings', 'category_id' => '2', 'ingredient_quantity' => ['2.500']],
++    ['product_name' => 'Other food', 'category_id' => '2', 'ingredient_quantity' => ['1.000']],
++    ['product_name' => 'Inactive food', 'category_id' => '2'],
++    ['product_name' => 'Unavailable food', 'category_id' => '2'],
++    ['product_name' => 'Stock-short food', 'category_id' => '2', 'ingredient_quantity' => ['200.000']],
++] as $overrides) check($products->save(productPayload($overrides)), 'Could not create the reward product.');
++check($products->setActive(4, false) && $products->setAvailable(5, false), 'Could not set product availability.');
++$loyalty = new Models\Loyalty();
++$issued = $loyalty->redeemItem($customerId, 2);
++$code = $issued['reward_code'];
++check($issued['product_id'] === 2 && $issued['product_name'] === 'Buffalo Wings'
++    && $issued['points'] === 15 && $issued['points_spent'] === 10
++    && preg_match('/^GC-[A-F0-9]{8}$/D', $code) === 1,
++    'The selected food must cost exactly ten points and return a complete cashier receipt.');
++$stored = $db->query('SELECT * FROM loyalty_redemptions')->fetch();
++check((int) $stored->product_id === 2 && $stored->product_name === 'Buffalo Wings'
++    && $stored->reward_code === $code && $stored->used_sale_id === null && $stored->used_at === null
++    && (float) $db->query('SELECT amount FROM inventory WHERE inv_id = 1')->fetchColumn() === 100.0,
++    'Issuance must save the selected product without consuming the voucher or ingredient stock.');
++foreach ([0, -1, 999, 4, 5, 6] as $id) {
++    rejectItemReward(fn() => $loyalty->redeemItem($customerId, $id), $db, 'Invalid/unavailable product ' . $id);
++}
++rejectItemReward(fn() => $loyalty->redeemItem(99999, 2), $db, 'Missing loyalty account');
++$second = $loyalty->redeemItem($customerId, 1);
++check($second['points'] === 5 && $second['points_spent'] === 10 && $second['reward_code'] !== $code,
++    'Every further ten points must allow another selected item with a new code and preserve the remainder.');
++rejectItemReward(fn() => $loyalty->redeemItem($customerId, 2), $db, 'Insufficient points');
++$db->prepare('UPDATE products SET product_name = ? WHERE product_id = 2')->execute(['Renamed wings']);
++$history = array_values(array_filter($loyalty->summary($customerId)['activity'], fn($row) => $row->reward_code === $code))[0];
++check($history->description === 'Buffalo Wings' && $history->status === 'available'
++    && $history->used_sale_id === null && $history->used_at === null,
++    'Activity must preserve the selected name and existing available/used status fields.');
++$metadata = $loyalty->reward($code);
++check($metadata['product_id'] === 2 && $metadata['product_name'] === 'Buffalo Wings'
++    && $metadata['points_spent'] === 10,
++    'Cashier reward metadata must identify the saved chosen item.');
++$lookup = itemRewardLookup($code);
++check($lookup['status'] === 'success'
++    && array_map(fn($product) => (int) $product->product_id, $lookup['data']['products']) === [2],
++    'The cashier lookup must offer only the bound food, regardless of its non-coffee category.');
++
++$pos = new Models\POS();
++$payload = [
++    'checkout_key' => 'chosen-item-checkout', 'reward_code' => $code,
++    'customer_name' => 'item-reward-member', 'amount_paid' => '0.00', 'expected_total' => '0.00',
++    'items' => [['product_id' => 2, 'quantity' => 1, 'unit_price' => 900, 'product_name' => 'Forged']],
++];
++foreach ([1, 3] as $id) {
++    rejectItemReward(fn() => $pos->checkout(array_replace($payload, [
++        'items' => [['product_id' => $id, 'quantity' => 1]],
++    ])), $db, 'Replacing the selected item with product ' . $id);
++}
++rejectItemReward(fn() => $pos->checkout(array_replace($payload, ['amount_paid' => '1.00'])), $db, 'Charging for a free item');
++$completed = $pos->checkout($payload);
++$sale = $pos->transaction((int) $completed['sale_id']);
++check((float) $completed['total_amount'] === 0.0 && (float) $completed['amount_paid'] === 0.0
++    && !$completed['loyalty_point_earned'] && count($sale->items) === 1
++    && (int) $sale->items[0]->product_id === 2 && (int) $sale->items[0]->quantity === 1
++    && (float) $sale->items[0]->unit_price === 0.0 && (float) $sale->items[0]->subtotal === 0.0
++    && (float) $db->query('SELECT amount FROM inventory WHERE inv_id = 1')->fetchColumn() === 97.5
++    && $loyalty->summary($customerId)['points'] === 5,
++    'The cashier must fulfill the selected food at zero price, consuming stock once without more point changes.');
++$used = array_values(array_filter($loyalty->summary($customerId)['activity'], fn($row) => $row->reward_code === $code))[0];
++check($used->status === 'used' && (int) $used->used_sale_id === (int) $completed['sale_id'] && !empty($used->used_at),
++    'Fulfillment must preserve the used-sale history and mark the voucher used.');
++$snapshot = itemRewardSnapshot($db);
++$replay = $pos->checkout($payload);
++check((int) $replay['sale_id'] === (int) $completed['sale_id'] && itemRewardSnapshot($db) === $snapshot,
++    'Retrying the same checkout must recover its receipt without another inventory deduction.');
++rejectItemReward(fn() => $pos->checkout(array_replace($payload, ['checkout_key' => 'chosen-item-reuse'])), $db, 'Reusing a fulfilled code');
++check(itemRewardLookup($code)['status'] === 'error' && http_response_code() === 400,
++    'A fulfilled chosen-item voucher must no longer be retrievable.');
++
++// A failed consumption must roll back the free sale and inventory together.
++$rollbackPayload = array_replace($payload, [
++    'checkout_key' => 'chosen-item-rollback', 'reward_code' => $second['reward_code'],
++    'items' => [['product_id' => 1, 'quantity' => 1]],
++]);
++if ($postgres) {
++    $db->exec('CREATE FUNCTION fail_chosen_reward_use() RETURNS trigger LANGUAGE plpgsql AS $$
++        BEGIN RAISE EXCEPTION \'Injected chosen reward failure\'; END; $$');
++    $db->exec('CREATE TRIGGER fail_chosen_reward_use BEFORE UPDATE OF used_sale_id ON loyalty_redemptions
++        FOR EACH ROW EXECUTE FUNCTION fail_chosen_reward_use()');
++} else {
++    $db->exec('CREATE TRIGGER fail_chosen_reward_use BEFORE UPDATE OF used_sale_id ON loyalty_redemptions
++        BEGIN SELECT RAISE(ABORT, \'Injected chosen reward failure\'); END');
++}
++$snapshot = itemRewardSnapshot($db);
++$failed = false;
++try { $pos->checkout($rollbackPayload); }
++catch (Throwable $error) { $failed = str_contains($error->getMessage(), 'Injected chosen reward failure'); }
++check($failed && !$db->inTransaction() && itemRewardSnapshot($db) === $snapshot,
++    'A failed chosen-voucher consumption must roll back the sale, stock and usage marker.');
++$db->exec('DROP TRIGGER fail_chosen_reward_use' . ($postgres ? ' ON loyalty_redemptions' : ''));
++if ($postgres) $db->exec('DROP FUNCTION fail_chosen_reward_use()');
++check(itemRewardLookup($second['reward_code'])['status'] === 'success', 'Failed fulfillment must leave its reward available.');
++
++// Exercise JSON input validation without a server or production credentials.
++class TestItemLoyaltyController extends Api\Loyalty\LoyaltyController {
++    public function json($data): void { throw new JsonResponse($data); }
++}
++class ItemJsonInput {
++    public $context;
++    public static string $body = '';
++    private int $position = 0;
++    public function stream_open($path, $mode, $options, &$openedPath): bool { return $path === 'php://input'; }
++    public function stream_read($count): string {
++        $result = substr(self::$body, $this->position, $count);
++        $this->position += strlen($result);
++        return $result;
++    }
++    public function stream_eof(): bool { return $this->position >= strlen(self::$body); }
++    public function stream_stat(): array { return []; }
++}
++function itemJsonRequest(string $body, string $method = 'POST'): array {
++    ItemJsonInput::$body = $body;
++    $_SERVER['REQUEST_METHOD'] = $method;
++    http_response_code(200);
++    try { (new TestItemLoyaltyController())->redeemItem(); }
++    catch (JsonResponse $response) { return $response->data; }
++    throw new RuntimeException('Item redemption must return JSON.');
++}
++$_SESSION['user'] = ['id' => $customerId, 'username' => 'item-reward-member', 'role' => 'loyal_customer'];
++$db->prepare('UPDATE loyal SET loyalty_points = 20 WHERE user_id = ?')->execute([$customerId]);
++stream_wrapper_unregister('php');
++stream_wrapper_register('php', ItemJsonInput::class);
++try {
++    foreach (['', '{', 'null', '[]', '{}', '{"product_id":0}', '{"product_id":"2"}',
++        '{"product_id":2.5}', '{"product_id":true}', '{"product_id":[2]}'] as $body) {
++        $before = itemRewardSnapshot($db);
++        $response = itemJsonRequest($body);
++        check($response['status'] === 'error' && http_response_code() === 400
++            && !empty($response['message']) && itemRewardSnapshot($db) === $before,
++            'Invalid JSON/IDs must not spend points or issue a voucher.');
++    }
++    $before = itemRewardSnapshot($db);
++    check(itemJsonRequest('{"product_id":2}', 'GET')['status'] === 'error' && http_response_code() === 405
++        && itemRewardSnapshot($db) === $before, 'Only POST may redeem a chosen item.');
++    $response = itemJsonRequest('{"product_id":2,"product_name":"Forged","points_spent":0}');
++    check($response['status'] === 'success' && http_response_code() === 200
++        && $response['data']['product_id'] === 2 && $response['data']['product_name'] === 'Renamed wings'
++        && $response['data']['points_spent'] === 10 && $response['data']['points'] === 10,
++        'The endpoint must return authoritative item/points data and ignore forged names or prices.');
++} finally { stream_wrapper_restore('php'); }
++
++echo "Chosen-item rewards passed: food selection, 10-point spending, bound cashier fulfillment, usage status, stock rollback and JSON validation.\n";

@@ -552,17 +552,38 @@ class ApiService {
         decoded = response.body;
       }
     }
-    if ((response.headers['content-type'] ?? '').contains('text/html')) {
-      throw StateError(
-        'The API returned a web page instead of JSON. Your session may have expired or this route may require different access.',
-      );
-    }
+    final isHtml = (response.headers['content-type'] ?? '')
+        .toLowerCase()
+        .contains('text/html');
     if (response.statusCode < 200 || response.statusCode >= 300) {
+      if (isHtml) {
+        if (response.statusCode == 404 && path == '/api/Loyalty/redeemItem') {
+          throw StateError(
+            'Item rewards are not available at the cafe yet. Please try again later.',
+          );
+        }
+        if (response.statusCode == 401) {
+          throw StateError('Please sign in again to continue.');
+        }
+        if (response.statusCode == 403) {
+          throw StateError(
+            'Your account does not have permission to perform this action.',
+          );
+        }
+        throw StateError(
+          'The cafe service could not complete this request. Please try again later.',
+        );
+      }
       final message = _errorMessage(decoded) ?? 'HTTP ${response.statusCode}';
       if (response.statusCode == 401 || response.statusCode == 403) {
         throw StateError('API authorization failed at ${uri.path}: $message');
       }
       throw StateError(message);
+    }
+    if (isHtml) {
+      throw StateError(
+        'The cafe service returned an unexpected response. Please try again later.',
+      );
     }
     _captureSessionCookie(response.headers['set-cookie']);
     if (unwrapData &&

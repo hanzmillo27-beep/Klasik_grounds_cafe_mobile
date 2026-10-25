@@ -165,6 +165,85 @@ void main() {
     },
   );
 
+  test(
+    'missing item route explains availability without blaming sign-in',
+    () async {
+      final paths = <String>[];
+      final service = serviceWith((request) async {
+        paths.add(request.url.path);
+        return http.Response(
+          'Page not found.',
+          404,
+          headers: {'content-type': 'text/html; charset=UTF-8'},
+        );
+      });
+
+      await expectLater(
+        service.redeemLoyalty(productId: '2'),
+        throwsA(
+          isA<StateError>().having(
+            (error) => error.message,
+            'message',
+            'Item rewards are not available at the cafe yet. Please try again later.',
+          ),
+        ),
+      );
+      expect(paths, ['/api/Loyalty/redeemItem']);
+    },
+  );
+
+  for (final response in <int, String>{
+    401: 'Please sign in again to continue.',
+    403: 'Your account does not have permission to perform this action.',
+  }.entries) {
+    test(
+      'HTML ${response.key} reports the actual authorization failure',
+      () async {
+        var requests = 0;
+        final service = serviceWith((request) async {
+          requests++;
+          return http.Response(
+            '<html><body>Access denied</body></html>',
+            response.key,
+            headers: {'content-type': 'text/html'},
+          );
+        });
+
+        await expectLater(
+          service.redeemLoyalty(productId: '2'),
+          throwsA(
+            isA<StateError>().having(
+              (error) => error.message,
+              'message',
+              response.value,
+            ),
+          ),
+        );
+        expect(requests, 1);
+      },
+    );
+  }
+
+  test('JSON HTTP errors keep the cafe message', () async {
+    final service = serviceWith(
+      (_) async => jsonResponse({
+        'status': 'error',
+        'message': 'This menu item has been removed.',
+      }, status: 404),
+    );
+
+    await expectLater(
+      service.redeemLoyalty(productId: '2'),
+      throwsA(
+        isA<StateError>().having(
+          (error) => error.message,
+          'message',
+          'This menu item has been removed.',
+        ),
+      ),
+    );
+  });
+
   test('a recipe stock shortage makes an item unavailable for redemption', () {
     final product = CafeProduct.fromMap({
       'product_id': 2,
