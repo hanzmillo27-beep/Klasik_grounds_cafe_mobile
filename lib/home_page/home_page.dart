@@ -1605,9 +1605,16 @@ class _RewardsPage extends StatelessWidget {
   const _RewardsPage({required this.controller});
   final CafeController controller;
 
+  Future<void> _chooseReward(BuildContext context) => showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => _RedeemItemDialog(controller: controller),
+  );
+
   @override
   Widget build(BuildContext context) {
     final profile = controller.profile;
+    final redemption = controller.lastRedemption;
     return ListView(
       padding: const EdgeInsets.fromLTRB(30, 27, 30, 38),
       children: [
@@ -1652,9 +1659,82 @@ class _RewardsPage extends StatelessWidget {
                 'Points in your loyalty account',
                 style: TextStyle(color: Colors.white70, fontSize: 13),
               ),
+              const SizedBox(height: 20),
+              const Text(
+                'Every 10 points = 1 item of your choice.',
+                style: TextStyle(color: Colors.white, fontSize: 14),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                controller.rewardsAvailable > 0
+                    ? '${controller.rewardsAvailable} free ${controller.rewardsAvailable == 1 ? 'item' : 'items'} available. '
+                          '${profile.loyaltyPoints % CafeController.pointsPerReward}/10 points toward your next item.'
+                    : '${controller.pointsToNextReward} more ${controller.pointsToNextReward == 1 ? 'point' : 'points'} to choose your free item.',
+                style: const TextStyle(color: Colors.white70, fontSize: 12),
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                onPressed: controller.canRedeemReward
+                    ? () => _chooseReward(context)
+                    : null,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.white,
+                  foregroundColor: forest,
+                  disabledBackgroundColor: Colors.white24,
+                  disabledForegroundColor: Colors.white70,
+                ),
+                icon: const Icon(Icons.redeem_outlined, size: 19),
+                label: const Text('Redeem'),
+              ),
+              if (!controller.products.any(
+                (product) => product.isAvailable,
+              )) ...[
+                const SizedBox(height: 8),
+                const Text(
+                  'No items are available to redeem right now.',
+                  style: TextStyle(color: Colors.white70, fontSize: 12),
+                ),
+              ],
             ],
           ),
         ),
+        if (redemption != null) ...[
+          const SizedBox(height: 18),
+          Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: const Color(0xFFEAF2E9),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: const Color(0xFFD3DED3)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Your reward is ready',
+                  style: TextStyle(color: forest, fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 8),
+                Text(redemption.productName),
+                const SizedBox(height: 8),
+                SelectableText(
+                  redemption.rewardCode,
+                  style: const TextStyle(
+                    color: forest,
+                    fontSize: 24,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 1,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '${redemption.pointsSpent} points redeemed. Show this code to the cashier to collect your item.',
+                  style: const TextStyle(color: mutedInk, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+        ],
         const SizedBox(height: 18),
         Wrap(
           spacing: 14,
@@ -1685,9 +1765,7 @@ class _RewardsPage extends StatelessWidget {
               borderRadius: BorderRadius.circular(18),
               border: Border.all(color: const Color(0xFFE8EAE3)),
             ),
-            child: const Text(
-              'The current API does not include loyalty activity history.',
-            ),
+            child: const Text('Your loyalty activity will appear here.'),
           )
         else
           Container(
@@ -1754,7 +1832,7 @@ class _RewardsPage extends StatelessWidget {
               SizedBox(width: 11),
               Expanded(
                 child: Text(
-                  'Your balance is loaded from the cafe loyalty API. Recent activity is not included in the supplied API responses.',
+                  'Each redemption uses 10 points for one available menu item. Unspent points stay in your account.',
                   style: TextStyle(color: mutedInk, fontSize: 12, height: 1.5),
                 ),
               ),
@@ -1764,6 +1842,123 @@ class _RewardsPage extends StatelessWidget {
       ],
     );
   }
+}
+
+class _RedeemItemDialog extends StatefulWidget {
+  const _RedeemItemDialog({required this.controller});
+
+  final CafeController controller;
+
+  @override
+  State<_RedeemItemDialog> createState() => _RedeemItemDialogState();
+}
+
+class _RedeemItemDialogState extends State<_RedeemItemDialog> {
+  CafeProduct? _selectedProduct;
+  bool _attempted = false;
+
+  Future<void> _redeem() async {
+    final product = _selectedProduct;
+    if (product == null || widget.controller.redeemingReward) return;
+    setState(() => _attempted = true);
+    try {
+      await widget.controller.redeemReward(product);
+      if (mounted) Navigator.of(context).pop();
+    } catch (_) {
+      // Keep the chosen item and show the controller's redemption error.
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: widget.controller,
+    builder: (context, _) {
+      final controller = widget.controller;
+      final busy = controller.redeemingReward;
+      final products = controller.products
+          .where((product) => product.isAvailable)
+          .toList();
+      return PopScope(
+        canPop: !busy,
+        child: AlertDialog(
+          title: const Text('Choose your free item'),
+          scrollable: true,
+          content: SizedBox(
+            width: 440,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Choose one available menu item for 10 points.'),
+                const SizedBox(height: 12),
+                SizedBox(
+                  height: MediaQuery.sizeOf(context).height * 0.34,
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: products.length,
+                    separatorBuilder: (_, _) => const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final product = products[index];
+                      final selected = _selectedProduct?.id == product.id;
+                      return ListTile(
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 4,
+                        ),
+                        selected: selected,
+                        selectedColor: forest,
+                        leading: Icon(
+                          selected
+                              ? Icons.radio_button_checked
+                              : Icons.radio_button_unchecked,
+                          color: selected ? forest : mutedInk,
+                        ),
+                        title: Text(product.name),
+                        subtitle: Text(product.category),
+                        onTap: busy
+                            ? null
+                            : () => setState(() => _selectedProduct = product),
+                      );
+                    },
+                  ),
+                ),
+                if (_attempted &&
+                    controller.redemptionErrorMessage != null) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    controller.redemptionErrorMessage!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                ],
+                if (busy) ...[
+                  const SizedBox(height: 12),
+                  const LinearProgressIndicator(color: forest),
+                  const SizedBox(height: 8),
+                  const Text('Redeeming your item...'),
+                ],
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: busy ? null : () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed:
+                  _selectedProduct != null &&
+                      controller.canRedeemReward &&
+                      !busy
+                  ? _redeem
+                  : null,
+              child: const Text('Redeem for 10 points'),
+            ),
+          ],
+        ),
+      );
+    },
+  );
 }
 
 class _RecentOrders extends StatelessWidget {

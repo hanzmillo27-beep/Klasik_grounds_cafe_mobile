@@ -8,6 +8,7 @@ import 'http_client_native.dart'
 import 'rate_limiter.dart';
 
 const cafeApiBaseUrl = 'https://klasik-grounds-cafe.onrender.com';
+const loyaltyPointsPerReward = 10;
 
 class CafeSession {
   const CafeSession({
@@ -49,7 +50,8 @@ class CafeProduct {
     description: '${row['description'] ?? 'Prepared fresh at Klasik Grounds.'}',
     price: _number(row['product_price'] ?? row['price']),
     isAvailable:
-        row['is_available'] as bool? ?? row['available'] as bool? ?? true,
+        (row['can_order'] as bool? ?? true) &&
+        (row['is_available'] as bool? ?? row['available'] as bool? ?? true),
     imageUrl: _stringOrNull(
       row['product_image_url'] ?? row['product_image'] ?? row['image_url'],
     ),
@@ -131,6 +133,22 @@ class LoyaltyActivity {
   final String detail;
   final DateTime createdAt;
   final bool isRedemption;
+}
+
+class LoyaltyRedemption {
+  const LoyaltyRedemption({
+    required this.rewardCode,
+    required this.productId,
+    required this.productName,
+    required this.points,
+    required this.pointsSpent,
+  });
+
+  final String rewardCode;
+  final String productId;
+  final String productName;
+  final int points;
+  final int pointsSpent;
 }
 
 /// HTTP client for the Klasik Grounds web API.
@@ -340,13 +358,33 @@ class ApiService {
     final response = await _request('GET', '/api/Loyalty/summary');
     final data = _asMap(response);
     final summary = _asMap(data['summary'] ?? data['loyalty'] ?? data);
+    final activity = _asList(summary['activity']).map((row) {
+      final entry = _asMap(row);
+      final code = _stringOrNull(entry['reward_code']);
+      final points = _integer(entry['points']);
+      return LoyaltyActivity(
+        title: '${entry['description'] ?? 'Loyalty activity'}',
+        detail:
+            '${points > 0 ? '+' : ''}$points points'
+            '${code == null ? '' : ' · $code'}',
+        createdAt:
+            _saleDate(entry['activity_date']) ??
+            DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+        isRedemption: entry['activity_type'] == 'redeemed',
+      );
+    }).toList();
     return MemberProfile(
       fullName: session.username,
       loyaltyPoints: _integer(
         summary['loyalty_points'] ?? summary['points'] ?? summary['balance'],
       ),
-      earningsCount: _integer(summary['earnings_count']),
-      redemptionsCount: _integer(summary['redemptions_count']),
+      earningsCount: summary['earnings_count'] == null
+          ? activity.where((entry) => !entry.isRedemption).length
+          : _integer(summary['earnings_count']),
+      redemptionsCount: summary['redemptions_count'] == null
+          ? activity.where((entry) => entry.isRedemption).length
+          : _integer(summary['redemptions_count']),
+      activity: activity,
     );
   }
 
@@ -414,11 +452,51 @@ class ApiService {
     );
   }
 
-  Future<dynamic> redeemLoyalty({required String rewardCode}) => _request(
-    'POST',
-    '/api/Loyalty/redeem',
-    body: {'reward_code': rewardCode},
-  );
+  Future<LoyaltyRedemption> redeemLoyalty({required String productId}) async {
+    final id = int.tryParse(productId);
+    if (id == null || id <= 0) {
+      throw StateError('Choose a valid menu item to redeem.');
+    }
+
+    // The legacy /redeem route ignores product selection and spends points on
+    // a generic coffee voucher. Use the item-aware endpoint exclusively.
+    final response = await _request(
+      'POST',
+      '/api/Loyalty/redeemItem',
+      body: {'product_id': id},
+      unwrapData: false,
+    );
+    final result = _asMap(response);
+    if (result['status'] == 'error' ||
+        result['success'] == false ||
+        result['error'] != null) {
+      throw StateError(_errorMessage(result) ?? 'The redemption was rejected.');
+    }
+    final data = _asMap(result['data']);
+    final code = _stringOrNull(data['reward_code']);
+    final name = _stringOrNull(data['product_name']);
+    final remaining = int.tryParse('${data['points']}');
+    final cost = int.tryParse('${data['points_spent']}');
+    if (result['status'] != 'success' ||
+        code == null ||
+        name == null ||
+        int.tryParse('${data['product_id']}') != id ||
+        remaining == null ||
+        remaining < 0 ||
+        cost != loyaltyPointsPerReward) {
+      throw StateError(
+        'The server did not return a complete redemption receipt. '
+        'Check with the cafe before redeeming again.',
+      );
+    }
+    return LoyaltyRedemption(
+      rewardCode: code,
+      productId: id.toString(),
+      productName: name,
+      points: remaining,
+      pointsSpent: cost!,
+    );
+  }
 
   Future<dynamic> _request(
     String method,

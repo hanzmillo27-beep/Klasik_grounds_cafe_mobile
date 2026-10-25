@@ -5,6 +5,8 @@ import '../services/api_service.dart';
 class CafeController extends ChangeNotifier {
   CafeController({required this.service, required this.session});
 
+  static const pointsPerReward = loyaltyPointsPerReward;
+
   final ApiService service;
   final CafeSession? session;
 
@@ -13,11 +15,14 @@ class CafeController extends ChangeNotifier {
       const {'owner', 'cashier'}.contains(session?.role);
   bool loading = true;
   bool placingOrder = false;
+  bool redeemingReward = false;
   bool refreshingRecentOrders = false;
   String? errorMessage;
   String? orderErrorMessage;
+  String? redemptionErrorMessage;
   String? recentOrdersErrorMessage;
   String? lastOrderId;
+  LoyaltyRedemption? lastRedemption;
   List<CafeProduct> products = const [];
   List<InventoryItem> inventory = const [];
   List<CafeOrder> recentOrders = const [];
@@ -38,6 +43,16 @@ class CafeController extends ChangeNotifier {
   );
 
   int get lowStockCount => inventory.where((item) => item.isLow).length;
+
+  int get rewardsAvailable => profile.loyaltyPoints ~/ pointsPerReward;
+  int get pointsToNextReward =>
+      pointsPerReward - profile.loyaltyPoints % pointsPerReward;
+  bool get canRedeemReward =>
+      session?.role == 'loyal_customer' &&
+      !loading &&
+      !redeemingReward &&
+      rewardsAvailable > 0 &&
+      products.any((product) => product.isAvailable);
 
   Future<void> load() async {
     loading = true;
@@ -158,6 +173,51 @@ class CafeController extends ChangeNotifier {
       rethrow;
     } finally {
       placingOrder = false;
+      notifyListeners();
+    }
+  }
+
+  Future<LoyaltyRedemption> redeemReward(CafeProduct product) async {
+    if (redeemingReward) {
+      throw StateError('A reward is already being redeemed.');
+    }
+    if (session?.role != 'loyal_customer') {
+      throw StateError('Sign in to a loyalty account to redeem a reward.');
+    }
+    if (profile.loyaltyPoints < pointsPerReward) {
+      throw StateError('You need 10 points to redeem an item.');
+    }
+    if (!products.any((item) => item.id == product.id && item.isAvailable)) {
+      throw StateError('Choose an available menu item to redeem.');
+    }
+    redeemingReward = true;
+    redemptionErrorMessage = null;
+    notifyListeners();
+    try {
+      final redemption = await service.redeemLoyalty(productId: product.id);
+      profile = MemberProfile(
+        fullName: profile.fullName,
+        loyaltyPoints: redemption.points,
+        earningsCount: profile.earningsCount,
+        redemptionsCount: profile.redemptionsCount + 1,
+        activity: [
+          LoyaltyActivity(
+            title: '${redemption.productName} reward',
+            detail:
+                '-${redemption.pointsSpent} points · ${redemption.rewardCode}',
+            createdAt: DateTime.now(),
+            isRedemption: true,
+          ),
+          ...profile.activity,
+        ],
+      );
+      lastRedemption = redemption;
+      return redemption;
+    } catch (error) {
+      redemptionErrorMessage = _friendlyError(error);
+      rethrow;
+    } finally {
+      redeemingReward = false;
       notifyListeners();
     }
   }
